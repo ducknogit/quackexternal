@@ -27,7 +27,7 @@ vcpkg_installed/
 
 # AI / editor session files
 .claude/
-memory/
+/memory/
 
 # Misc
 __pycache__/
