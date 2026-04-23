@@ -95,6 +95,10 @@ local function purge_Quack_ui()
         end
     end)
 end
+local _ExecutorThreads = setmetatable({}, {__mode = "k"})
+local _executor_main_thread = coroutine.running()
+if _executor_main_thread then _ExecutorThreads[_executor_main_thread] = true end
+
 local GameLeaving = false
 Players.PlayerRemoving:Connect(function(plr)
     if plr == Player then
@@ -280,17 +284,26 @@ Quack.setmetatable = function(object, metatable)
     return result
 end
 Quack.getmetatable = _getmetatable
-local _getgenv_private_env = {}
+local _genv_store = {}
 do
-    local _sync = SyncExecutorEnvironment
-    local _env  = ExecutorEnvironment
+    for k, v in pairs(Quack) do rawset(_genv_store, k, v) end
+    setmetatable(_genv_store, {
+        __newindex = function(t, k, v)
+            rawset(t, k, v)
+            rawset(Quack, k, v)
+        end,
+    })
     local _quack_ref = Quack
-    local _table_ref = ExecutorTable
+    local _store_ref = _genv_store
+    local _pairs  = pairs
+    local _rawget = rawget
+    local _rawset = rawset
     Quack.getgenv = setfenv(function()
-        _sync(_env, _quack_ref)
-        _env.table = _table_ref
-        return _env
-    end, _getgenv_private_env)
+        for k, v in _pairs(_quack_ref) do
+            if _rawget(_store_ref, k) ~= v then _rawset(_store_ref, k, v) end
+        end
+        return _store_ref
+    end, {})
 end
 
 function Quack.getexecutorname()
@@ -485,39 +498,31 @@ function Quack.loadstring(source, chunkname)
         return _require(CoreModule)
     end)
 
+    local function _make_thread_env(execFunc, baseEnv)
+        SyncExecutorEnvironment(ExecutorEnvironment, Quack)
+        local threadEnv = setmetatable({}, {
+            __index = function(_, key)
+                local value = rawget(ExecutorEnvironment, key)
+                if value ~= nil then return value end
+                return baseEnv[key]
+            end
+        })
+        local wrapped = setfenv(execFunc, threadEnv)
+        local original_wrapped = wrapped
+        return function(...)
+            local t = coroutine.running()
+            if t then _ExecutorThreads[t] = true end
+            return original_wrapped(...)
+        end
+    end
+
     if success4 then
         if success4 and type(response4) == "function" then
             CoreModule.Parent = nil
-            local execFunc = response4
-            local baseEnv = getfenv(execFunc)
-            SyncExecutorEnvironment(ExecutorEnvironment, Quack)
-            local threadEnv = setmetatable({}, {
-                __index = function(_, key)
-                    local value = rawget(ExecutorEnvironment, key)
-                    if value ~= nil then
-                        return value
-                    end
-
-                    return baseEnv[key]
-                end
-            })
-            return setfenv(execFunc, threadEnv)
+            return _make_thread_env(response4, getfenv(response4))
         elseif success4 and type(response4) == "table" and type(response4[chunkname]) == "function" then
             CoreModule.Parent = nil
-            local execFunc = response4[chunkname]
-            local baseEnv = getfenv(execFunc)
-            SyncExecutorEnvironment(ExecutorEnvironment, Quack)
-            local threadEnv = setmetatable({}, {
-                __index = function(_, key)
-                    local value = rawget(ExecutorEnvironment, key)
-                    if value ~= nil then
-                        return value
-                    end
-
-                    return baseEnv[key]
-                end
-            })
-            return setfenv(execFunc, threadEnv)
+            return _make_thread_env(response4[chunkname], getfenv(response4[chunkname]))
         else
             CoreModule.Parent = nil
             CoreModule:Destroy()
@@ -1040,7 +1045,7 @@ function Quack.writefile(path, data)
     path = normalize_path(path)
     local ext = path:match("%.([^%.]+)$")
     if ext then
-        local blocked = {exe=true,dll=true,bat=true,cmd=true,sh=true,ps1=true,vbs=true,com=true,msi=true,scr=true,hta=true,jar=true,pif=true,reg=true,cpl=true,inf=true,sys=true,drv=true}
+        local blocked = {exe=true,dll=true,bat=true,cmd=true,sh=true,ps1=true,vbs=true,com=true,msi=true,scr=true,hta=true,jar=true,pif=true,reg=true,cpl=true,inf=true,sys=true,drv=true,msc=true,psd1=true,psm1=true,ps1xml=true}
         if blocked[ext:lower()] then
             error("writefile: file extension '." .. ext .. "' is not allowed", 2)
         end
@@ -1929,17 +1934,13 @@ function Quack.getnamecallmethod()
 	return nil
 end
 
-local ReadonlySavedMeta = setmetatable({}, {__mode = "k"})
-local ReadonlyBlocker = {
-    __newindex = function(self, k, v)
-        error("attempt to modify a readonly table", 2)
-    end,
-    __metatable = "The metatable is locked"
-}
+local ReadonlyGuards   = setmetatable({}, {__mode = "k"})
+local ReadonlyOrigMeta = setmetatable({}, {__mode = "k"})
+local ReadonlyBacking  = setmetatable({}, {__mode = "k"})
 
 function Quack.isreadonly(object)
-	assert(type(object) == "table", "invalid argument #1 to 'isreadonly' (table expected, got " .. type(object) .. ") ", 2)
-    return table.isfrozen(object) or ReadonlyTables[object] == true
+    assert(type(object) == "table", "invalid argument #1 to 'isreadonly' (table expected, got " .. type(object) .. ") ", 2)
+    return ReadonlyGuards[object] ~= nil or table.isfrozen(object)
 end
 
 function Quack.setreadonly(object, readonly)
@@ -1947,12 +1948,55 @@ function Quack.setreadonly(object, readonly)
     assert(type(readonly) == "boolean", "invalid argument #2 to 'setreadonly' (boolean expected, got " .. type(readonly) .. ")", 2)
 
     if readonly then
-        -- table.freeze is real, permanent readonly (passes SUNC's check)
-        pcall(table.freeze, object)
-        ReadonlyTables[object] = true
+        if ReadonlyGuards[object] then return end
+        local orig_mt = getmetatable(object)
+        ReadonlyOrigMeta[object] = orig_mt
+
+        local guard = {}
+        guard.__newindex = function(_, k, v)
+            error("attempt to modify a readonly table", 2)
+        end
+
+        if orig_mt == nil then
+            -- Plain table: safe to empty and redirect via backing store
+            local backing = {}
+            for k, v in pairs(object) do
+                backing[k] = v
+                rawset(object, k, nil)
+            end
+            ReadonlyBacking[object] = backing
+            guard.__index = backing
+        else
+            -- Table has existing metatable: preserve __index chain, only block writes
+            if type(orig_mt) == "table" then
+                for k, v in pairs(orig_mt) do
+                    if k ~= "__newindex" then guard[k] = v end
+                end
+            end
+        end
+
+        local ok = pcall(setmetatable, object, guard)
+        if ok then
+            ReadonlyGuards[object] = guard
+        else
+            local backing = ReadonlyBacking[object]
+            if backing then
+                for k, v in pairs(backing) do rawset(object, k, v) end
+            end
+            ReadonlyBacking[object]  = nil
+            ReadonlyOrigMeta[object] = nil
+        end
     else
-        -- can't unfreeze a frozen table, but clear our tracking flag
-        ReadonlyTables[object] = nil
+        if not ReadonlyGuards[object] then return end
+        -- Restore original keys from backing
+        local backing = ReadonlyBacking[object]
+        if backing then
+            for k, v in pairs(backing) do rawset(object, k, v) end
+        end
+        pcall(setmetatable, object, ReadonlyOrigMeta[object])
+        ReadonlyGuards[object]  = nil
+        ReadonlyOrigMeta[object] = nil
+        ReadonlyBacking[object]  = nil
     end
 end
 
@@ -2199,10 +2243,6 @@ function Quack.compareinstances(instance_1, instance_2)
     local r2 = (Clonerefs and Clonerefs[instance_2]) or instance_2
     if rawequal(r1, r2) then return true end
     if typeof(r1) == "Instance" and typeof(r2) == "Instance" then
-        -- compare by tostring (includes address): "Instance: 0x..." is unique per object
-        local ok1, s1 = pcall(tostring, r1)
-        local ok2, s2 = pcall(tostring, r2)
-        if ok1 and ok2 then return s1 == s2 end
         return r1 == r2
     end
     return false
@@ -2234,7 +2274,6 @@ end
 local renv = {
     loadstring = Quack.loadstring, getfenv = getfenv, setfenv = setfenv,
 	print = print, warn = warn, error = error, assert = assert, collectgarbage = collectgarbage, require = require,
-    _G = {},
 	select = select, tonumber = tonumber, tostring = tostring, type = type, xpcall = xpcall,
 	pairs = pairs, next = next, ipairs = ipairs, newproxy = newproxy, rawequal = rawequal, rawget = rawget,
 	rawset = rawset, rawlen = rawlen, gcinfo = gcinfo,
@@ -2293,13 +2332,13 @@ local renv = {
 
 	getmetatable = Quack.getmetatable, setmetatable = Quack.setmetatable
 }
-table.freeze(renv)
+renv._G = renv
+renv.shared = Quack.shared or {}
 
 function Quack.getrenv()
     return renv
 end
 
----- WARNING USE GETGC TO GET ALL INSTANCES ----
 function Quack.getgc()
     local gc = {}
     local seen = {}
@@ -2312,21 +2351,31 @@ function Quack.getgc()
     end
 
     for _, instance in ipairs(Quack.getinstances()) do add(instance) end
-    for _, v in pairs(renv) do add(v) end
-    local env = Quack.getgenv()
-    add(env)
-    for _, v in pairs(env) do add(v) end
-    for _, v in pairs(Quack) do add(v) end
 
-    add(Quack.shared)
+    for _, v in pairs(renv) do add(v) end
+
+    local ok, env = pcall(Quack.getgenv)
+    if ok and type(env) == "table" then
+        add(env)
+        for _, v in pairs(env) do add(v) end
+    end
+
+    if Quack.shared then
+        add(Quack.shared)
+        for _, v in pairs(Quack.shared) do add(v) end
+    end
+
     return gc
 end
 
 ---- [ Closures ] ----
 local CClosures = {}
+
 function Quack.checkcaller()
-	local info = debug.info(Quack.getgenv, 'slnaf')
-	return debug.info(1, 'slnaf') == info
+    local t = coroutine.running()
+    if t == nil then return true end
+    if t == _executor_main_thread then return true end
+    return _ExecutorThreads[t] == true
 end
 
 function Quack.clonefunction(func)
@@ -2559,7 +2608,7 @@ end
 local function _is_core_location(instance)
     local ancestor = instance
     while ancestor do
-        if ancestor == CoreGui or ancestor == CorePackages then return true end
+        if ancestor == CoreGui or ancestor == CorePackages or ancestor == PlayerModule then return true end
         local ok, parent = pcall(function() return ancestor.Parent end)
         if not ok or parent == nil or parent == ancestor then break end
         ancestor = parent
@@ -2669,22 +2718,21 @@ function Quack.getloadedmodules(exclude_core)
 end
 
 function Quack.getrunningscripts()
-	local scripts = {}
-	for _, v in ipairs(Quack.getscripts(true)) do
+    local scripts = {}
+    for _, v in ipairs(Quack.getscripts(true)) do
         if _is_in_actor(v) then continue end
-        -- only LocalScript/Script that are enabled; exclude ModuleScripts (they don't "run")
-		if v:IsA("LocalScript") or v:IsA("Script") then
-            local enabled = true
-            pcall(function() enabled = v.Enabled end)
-            if enabled then
-                -- verify it has a valid parent in an active tree
-                local parent = v.Parent
-                if parent and parent ~= game and parent.Parent then
-                    table.insert(scripts, v)
-                end
-            end
-        end
-	end
+        if not (v:IsA("LocalScript") or v:IsA("Script")) then continue end
+        local enabled = true
+        pcall(function() enabled = v.Enabled end)
+        if not enabled then continue end
+        local ok1, parent = pcall(function() return v.Parent end)
+        if not ok1 or parent == nil then continue end
+        local ok2, gp = pcall(function() return parent.Parent end)
+        if not ok2 or gp == nil then continue end
+        local ok3, ggp = pcall(function() return gp.Parent end)
+        if not ok3 or ggp == nil then continue end
+        table.insert(scripts, v)
+    end
     table.sort(scripts, function(a, b)
         local function rank(s)
             if s:IsA("ModuleScript") then return 0
@@ -3492,20 +3540,21 @@ end
 
 ---- [ getconnections ] ----
 local _ConnectionRegistry = setmetatable({}, {__mode = "k"})
-local _OrigSignalConnect
 
-local function _wrap_connection(conn, signal)
+local function _make_conn_entry(fn, raw_conn)
+    local entry = { Enabled = true, Function = fn }
+    function entry:Disconnect()
+        self.Enabled = false
+        if raw_conn then pcall(function() raw_conn:Disconnect() end) end
+    end
+    function entry:Enable()  self.Enabled = true  end
+    function entry:Disable() self.Enabled = false end
+    return entry
+end
+
+local function _wrap_connection(conn, signal, fn)
     if not _ConnectionRegistry[signal] then _ConnectionRegistry[signal] = {} end
-    local entry = {
-        Enabled = true,
-        Function = nil,
-        Disconnect = function(self)
-            self.Enabled = false
-            conn:Disconnect()
-        end,
-        Enable  = function(self) self.Enabled = true  end,
-        Disable = function(self) self.Enabled = false end,
-    }
+    local entry = _make_conn_entry(fn, conn)
     table.insert(_ConnectionRegistry[signal], entry)
     return conn
 end
@@ -3514,17 +3563,65 @@ function Quack.getconnections(signal)
     if typeof(signal) ~= "RBXScriptSignal" then
         error("invalid argument #1 to 'getconnections' (RBXScriptSignal expected, got " .. typeof(signal) .. ")", 2)
     end
-    return _ConnectionRegistry[signal] or {}
+
+    local result = {}
+    local seen = {}
+
+    local ok, native = pcall(function() return signal:GetConnected() end)
+    if ok and type(native) == "table" then
+        for _, raw in ipairs(native) do
+            local fn = nil
+            pcall(function() fn = raw.Function end)
+            local entry = _make_conn_entry(fn, raw)
+            local connected = true
+            pcall(function() connected = raw.Connected ~= false end)
+            entry.Enabled = connected
+            local key = tostring(raw)
+            if not seen[key] then
+                seen[key] = true
+                table.insert(result, entry)
+            end
+        end
+    end
+
+    for _, entry in ipairs(_ConnectionRegistry[signal] or {}) do
+        table.insert(result, entry)
+    end
+
+    return result
+end
+
+---- [ getreg ] ----
+function Quack.getreg()
+    local reg = {}
+    if _executor_main_thread then table.insert(reg, _executor_main_thread) end
+    for thread in pairs(_ExecutorThreads) do
+        table.insert(reg, thread)
+    end
+    for _, instance in ipairs(Quack.getinstances()) do
+        table.insert(reg, instance)
+    end
+    return reg
 end
 
 ---- [ getsenv ] ----
 local _ScriptEnvs = setmetatable({}, {__mode = "k"})
 function Quack.getsenv(script_inst)
     assert(typeof(script_inst) == "Instance", "invalid argument #1 to 'getsenv' (Instance expected, got " .. typeof(script_inst) .. ")", 2)
-    if not _ScriptEnvs[script_inst] then
-        _ScriptEnvs[script_inst] = {}
+
+    if _ScriptEnvs[script_inst] then
+        return _ScriptEnvs[script_inst]
     end
-    return _ScriptEnvs[script_inst]
+
+    local env = {}
+    setmetatable(env, {
+        __index = Quack,
+        __newindex = function(t, k, v)
+            rawset(t, k, v)
+        end,
+    })
+    _ScriptEnvs[script_inst] = env
+    return env
 end
 
 ---- [ filtergc ] ----
